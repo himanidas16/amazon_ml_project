@@ -1,0 +1,14 @@
+# Pinned to the versions actually used and tested on this machine.
+# Python 3.13.11 on Linux. Regenerate with: pip freeze | grep -iE '<these>'
+#
+# lightgbm is MIT licensed, which satisfies the challenge's MIT/Apache
+# model-license rule. No pretrained model weights are used.
+pandas==3.0.2
+numpy==2.4.4
+scikit-learn==1.8.0
+scipy==1.17.1
+lightgbm==4.7.0
+rapidfuzz==3.14.6
+pyarrow==25.0.1
+PyYAML==6.0.3
+pytest==9.1.1
