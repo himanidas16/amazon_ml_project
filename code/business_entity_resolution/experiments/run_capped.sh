@@ -13,6 +13,10 @@
 # and the job runs as a systemd service unit with OOMPolicy=stop, which kills the
 # script AND all its worker processes together when the cap is hit (a plain
 # --scope can leave orphaned workers holding memory).
+#
+# No MemoryHigh (soft limit): on 2026-09-25 it throttled a run at 90% of the cap
+# for 20 minutes at ~1% CPU instead of failing.  A clean stop is better -- the
+# pipeline resumes from its saved stages.
 set -euo pipefail
 
 MAX_GB=8
@@ -32,9 +36,9 @@ fi
 echo "[run_capped] free now: $((avail_kb / 1024)) MB  ->  memory cap: ${cap_mb} MB" >&2
 
 exec systemd-run --user --wait --pipe --collect --quiet \
-    -p MemoryMax="${cap_mb}M" -p MemoryHigh="$((cap_mb * 9 / 10))M" \
+    -p MemoryMax="${cap_mb}M" \
     -p MemorySwapMax=0 -p OOMPolicy=stop \
     -p WorkingDirectory="$PWD" \
     -E PYTHONHASHSEED=0 -E OPENBLAS_NUM_THREADS=1 -E OMP_NUM_THREADS=1 -E MKL_NUM_THREADS=1 \
-    -E PATH="$PATH" \
+    -E PATH="$PATH" -E PYTHONPATH="$(cd "$(dirname "$0")/.." && pwd)/src${PYTHONPATH:+:$PYTHONPATH}" \
     python3 -u "$@"

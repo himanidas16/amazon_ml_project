@@ -1,0 +1,412 @@
+"""Pair features: describe each (S1 record, candidate) pair with numbers.
+
+Blocking (retrieve.py) hands us ~50 candidates per S1 record.  The model in
+Step 7 cannot read text, so for every pair we answer the same fixed list of
+questions -- "how similar are the names?", "do the street numbers agree?",
+"is the address missing?" -- and the answers become one row of a table.
+
+Principles
+----------
+* Several similarity measures per field, because each catches different
+  noise: edit ratio (typos), Jaro-Winkler (typos near the start), token-sort
+  (word order), token-set (extra words such as "Consulting Consulting").
+* Rarity matters.  Sharing "nematech" is strong evidence, sharing "solutions"
+  is weak, so word overlap is weighted by log(IDF_REF / count) from the same
+  TRAINING-only token table blocking uses.
+* Blanks are never evidence.  If either side of a field is empty, its
+  similarities are NaN ("unknown"), not 1.0.  LightGBM handles NaN natively
+  and learns what missingness means.  Two empty addresses do not "match".
+* A number conflict is evidence, not a veto: street numbers drift (2046 vs
+  2048) in real true pairs, so we give the gap as a number and let the model
+  decide.
+* No country feature and no ids: the model must not memorise US vs India
+  (France never appears in training) or learn from id numbering.
+* Context: a candidate is judged partly against its rivals -- "is this the
+  best name match this S1 record has?" -- which separates a true match from a
+  sibling branch with a similar name.
+
+All features for one S1 record are computed in the same block, so context
+features see every rival.  Blocks run in parallel worker processes; only
+plain lists and numpy arrays cross the process boundary.
+"""
+
+from __future__ import annotations
+
+import math
+import re
+from multiprocessing import get_context
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+import pandas as pd
+from rapidfuzz import fuzz, process
+from rapidfuzz.distance import JaroWinkler
+
+from .normalize import address_views, has_indic, name_views
+from .retrieve import CHANNELS, IDF_REF, TokenFreq, _die_with_parent, glued_name
+
+FEATURES_VERSION = "1.0.0"
+
+_DIGITS = re.compile(r"\d+")
+POSTAL_LENGTHS = (5, 6)   # US ZIP / France code postal = 5 digits, India PIN = 6
+
+
+# --------------------------------------------------------------------------
+# per-record preparation (done once per record, not once per pair)
+# --------------------------------------------------------------------------
+
+PREP_COLUMNS = ("name", "name_ns", "glued", "addr", "nums", "indic")
+
+
+def canonical_numbers(text: str) -> List[str]:
+    """Digit groups with leading zeros stripped, first-occurrence order, no
+    repeats.  "09585 Duffney, #09585" -> ["9585"].  Order is kept because the
+    first number of an address is usually the street number."""
+    seen, out = set(), []
+    for n in _DIGITS.findall(text):
+        n = n.lstrip("0") or "0"
+        if n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out
+
+
+def prepare_one(name: str, address: str) -> Tuple[str, str, str, str, str, int]:
+    """The text views a pair comparison needs, computed once per record."""
+    nv, av = name_views(name), address_views(address)
+    return (
+        nv["folded"],                                   # cleaned, transliterated name
+        nv["nosuffix"],                                 # ... without Ltd/Pvt/LLC
+        glued_name(nv["folded"]),                       # "vdrcornerstonepegasus"
+        av["expanded"],                                 # cleaned address, Rd -> road
+        " ".join(canonical_numbers(av["folded"])),      # folded view: Indic digits are ASCII
+        int(has_indic(name) or has_indic(address)),     # was transliteration needed?
+    )
+
+
+def _prepare_frame(rows) -> pd.DataFrame:
+    df = pd.DataFrame(rows, columns=list(PREP_COLUMNS))
+    for c in PREP_COLUMNS[:-1]:
+        df[c] = df[c].astype("str")          # Arrow-backed: a few flat buffers
+    df["indic"] = df["indic"].astype(np.int8)
+    return df
+
+
+def _prepare_task(args):
+    names, addrs = args
+    # Built inside the worker, so the parent never holds millions of tuples.
+    return _prepare_frame([prepare_one(n, a) for n, a in zip(names, addrs)])
+
+
+def prepare(names: Sequence[str], addrs: Sequence[str], workers: int = 0,
+            chunk: int = 20_000) -> pd.DataFrame:
+    """prepare_one over many records, in parallel; rows keep their order.
+
+    The result uses pandas' Arrow-backed string columns: millions of strings
+    in a few flat buffers instead of millions of Python objects.
+    """
+    tasks = [(list(names[s:s + chunk]), list(addrs[s:s + chunk]))
+             for s in range(0, len(names), chunk)]
+    if workers and workers > 1 and len(tasks) > 1:
+        with get_context("fork").Pool(workers, initializer=_die_with_parent) as pool:
+            parts = pool.map(_prepare_task, tasks)
+    else:
+        parts = [_prepare_task(t) for t in tasks]
+    if not parts:
+        return _prepare_frame([])
+    return pd.concat(parts, ignore_index=True)
+
+
+# --------------------------------------------------------------------------
+# the feature list -- order is the model's input contract
+# --------------------------------------------------------------------------
+
+FEATURE_NAMES: Tuple[str, ...] = (
+    # names
+    "name_ratio", "name_jw", "name_tsort", "name_tset", "ns_ratio", "ns_tset",
+    "name_equal", "glued_equal", "name_len_a", "name_len_t", "name_len_ratio",
+    "name_jacc", "name_wov", "name_wshared_max", "name_wmiss_a", "name_wmiss_t",
+    # addresses
+    "addr_ratio", "addr_tsort", "addr_tset", "addr_jacc", "addr_wov",
+    "addr_wshared_max", "addr_empty_a", "addr_empty_t", "addr_len_ratio",
+    # numbers
+    "num_n_a", "num_n_t", "num_shared", "num_jacc", "num_first_equal",
+    "num_conflict", "num_min_reldiff", "postal_equal", "postal_conflict",
+    # script
+    "indic_a", "indic_t",
+    # retrieval
+    "ret_score", "ret_rank", "is_s3", "n_channels",
+    *(f"ch_{c}" for c in CHANNELS),
+    # context: compared with the same S1 record's other candidates
+    "n_cands", "ret_score_gap", "name_tset_gap", "addr_tset_gap",
+    "name_tset_lead", "addr_tset_lead", "combo_rank",
+)
+F_INDEX = {f: i for i, f in enumerate(FEATURE_NAMES)}
+
+
+# --------------------------------------------------------------------------
+# helpers
+# --------------------------------------------------------------------------
+
+def _masked_sim(a: List[str], t: List[str], scorer, scale: float) -> np.ndarray:
+    """Element-wise similarity in [0,1]; NaN where either side is empty.
+    rapidfuzz scores "" vs "" as a perfect 100 -- exactly what must not reach
+    the model."""
+    s = process.cpdist(a, t, scorer=scorer, workers=1).astype(np.float32) / scale
+    empty = np.fromiter((not x or not y for x, y in zip(a, t)), bool, len(a))
+    s[empty] = np.nan
+    return s
+
+
+def _eligible(tokens: List[str], field: str) -> List[str]:
+    """Same token filter as blocking keys, so weights come from the same table."""
+    if field == "n":
+        return sorted({t for t in tokens if len(t) >= 3})
+    return sorted({t for t in tokens if len(t) >= 4 and not t.isdigit()})
+
+
+def _token_block(a_txt: List[str], t_txt: List[str], countries: List[str], field: str,
+                 freq: Optional[TokenFreq]) -> np.ndarray:
+    """Jaccard, rarity-weighted overlap, max shared weight, and the share of
+    each side's weight left unmatched.  Returns (n, 5) float32; NaN if a side
+    has no eligible tokens."""
+    n = len(a_txt)
+    out = np.full((n, 5), np.nan, dtype=np.float32)
+    a_tok = [_eligible(x.split(), field) for x in a_txt]
+    t_tok = [_eligible(x.split(), field) for x in t_txt]
+
+    # one vectorised lookup for every token in the block
+    known = freq.countries if freq is not None else frozenset()
+    strs: List[str] = []
+    for c, at, tt in zip(countries, a_tok, t_tok):
+        scope = c if c in known else "*"
+        strs.extend(f"{field}|{scope}|{x}" for x in at)
+        strs.extend(f"{field}|{scope}|{x}" for x in tt)
+    if freq is not None:
+        w_all = np.log(IDF_REF / freq.lookup(strs).astype(np.float64))
+    else:
+        w_all = np.full(len(strs), math.log(IDF_REF))
+    w_all = w_all.tolist()
+
+    pos = 0
+    for i, (at, tt) in enumerate(zip(a_tok, t_tok)):
+        wa = dict(zip(at, w_all[pos:pos + len(at)])); pos += len(at)
+        wt = dict(zip(tt, w_all[pos:pos + len(tt)])); pos += len(tt)
+        if not wa or not wt:
+            continue
+        shared = wa.keys() & wt.keys()
+        union = wa.keys() | wt.keys()
+        w_shared = sum(max(wa[x], wt[x]) for x in shared)
+        w_union = sum(max(wa.get(x, 0.0), wt.get(x, 0.0)) for x in union)
+        sa, st = sum(wa.values()), sum(wt.values())
+        out[i, 0] = len(shared) / len(union)
+        out[i, 1] = w_shared / w_union if w_union > 0 else 0.0
+        out[i, 2] = max((max(wa[x], wt[x]) for x in shared), default=0.0) / math.log(IDF_REF)
+        out[i, 3] = sum(w for x, w in wa.items() if x not in wt) / sa if sa > 0 else 0.0
+        out[i, 4] = sum(w for x, w in wt.items() if x not in wa) / st if st > 0 else 0.0
+    return out
+
+
+def _number_block(a_nums: List[str], t_nums: List[str]) -> np.ndarray:
+    """(n, 9): counts, shared, Jaccard, first-number equal, conflict, closest
+    relative gap, postal equal, postal conflict.  NaN = not applicable."""
+    out = np.full((len(a_nums), 9), np.nan, dtype=np.float32)
+    for i, (x, y) in enumerate(zip(a_nums, t_nums)):
+        a, t = x.split(), y.split()
+        out[i, 0], out[i, 1] = len(a), len(t)
+        if not a or not t:
+            continue
+        sa, st = set(a), set(t)
+        sh = sa & st
+        out[i, 2] = len(sh)
+        out[i, 3] = len(sh) / len(sa | st)
+        out[i, 4] = float(a[0] == t[0])
+        out[i, 5] = float(not sh)
+        # closest pair of numbers, relative gap: 2046 vs 2048 -> ~0.001
+        best = 1.0
+        for p in a[:4]:
+            ip = int(p)
+            for q in t[:4]:
+                iq = int(q)
+                m = max(ip, iq)
+                best = min(best, abs(ip - iq) / m if m else 0.0)
+        out[i, 6] = best
+        pa = {p for p in a if len(p) in POSTAL_LENGTHS}
+        pt = {q for q in t if len(q) in POSTAL_LENGTHS}
+        if pa and pt:
+            out[i, 7] = float(bool(pa & pt))
+            out[i, 8] = float(not (pa & pt))
+    return out
+
+
+def _group_context(group: np.ndarray, v: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """For each row: (group max - v, v - best OTHER value in the group).
+
+    gap  = 0 for the best candidate, larger for weaker ones.
+    lead > 0 only for a candidate that beats every rival, and by how much;
+    a lone candidate gets lead = v.  NaN values count as 0 here."""
+    v0 = np.nan_to_num(v, nan=0.0).astype(np.float64)
+    n = len(v0)
+    order = np.lexsort((-v0, group))
+    g_sorted = group[order]
+    starts = np.flatnonzero(np.r_[True, g_sorted[1:] != g_sorted[:-1]])
+    sizes = np.diff(np.r_[starts, n])
+    best = np.repeat(v0[order[starts]], sizes)
+    second_pos = starts + 1
+    has_second = sizes > 1
+    second = np.zeros(len(starts))
+    second[has_second] = v0[order[second_pos[has_second]]]
+    second = np.repeat(second, sizes)
+    is_first = np.zeros(n, bool); is_first[starts] = True
+    other = np.where(is_first, second, best)          # best rival of each row
+    gap = np.empty(n); lead = np.empty(n)
+    gap[order] = best - v0[order]
+    lead[order] = v0[order] - other
+    return gap.astype(np.float32), lead.astype(np.float32)
+
+
+# --------------------------------------------------------------------------
+# one block of pairs
+# --------------------------------------------------------------------------
+
+_SHARED: dict = {}   # frequency table shared with forked workers (read-only numpy)
+
+
+def pair_block(a: Dict[str, list], t: Dict[str, list], countries: List[str],
+               meta: Dict[str, np.ndarray], freq: Optional[TokenFreq] = None) -> np.ndarray:
+    """Features for a block of pairs.  a / t map PREP_COLUMNS to per-pair
+    lists (anchor side, candidate side); meta holds the retrieval arrays
+    'anchor', 'score', 'rank', 'channels', 'source' aligned with the pairs.
+    Every candidate of an anchor must be in the same block.
+    Returns float32 (n_pairs, len(FEATURE_NAMES))."""
+    n = len(countries)
+    X = np.full((n, len(FEATURE_NAMES)), np.nan, dtype=np.float32)
+    if n == 0:
+        return X
+    col = lambda f: F_INDEX[f]
+
+    # names
+    X[:, col("name_ratio")] = _masked_sim(a["name"], t["name"], fuzz.ratio, 100)
+    X[:, col("name_jw")] = _masked_sim(a["name"], t["name"], JaroWinkler.normalized_similarity, 1)
+    X[:, col("name_tsort")] = _masked_sim(a["name"], t["name"], fuzz.token_sort_ratio, 100)
+    X[:, col("name_tset")] = _masked_sim(a["name"], t["name"], fuzz.token_set_ratio, 100)
+    X[:, col("ns_ratio")] = _masked_sim(a["name_ns"], t["name_ns"], fuzz.ratio, 100)
+    X[:, col("ns_tset")] = _masked_sim(a["name_ns"], t["name_ns"], fuzz.token_set_ratio, 100)
+    la = np.fromiter((len(x) for x in a["name"]), np.float32, n)
+    lt = np.fromiter((len(x) for x in t["name"]), np.float32, n)
+    X[:, col("name_len_a")], X[:, col("name_len_t")] = la, lt
+    with np.errstate(invalid="ignore", divide="ignore"):
+        X[:, col("name_len_ratio")] = np.where(np.maximum(la, lt) > 0,
+                                               np.minimum(la, lt) / np.maximum(la, lt), np.nan)
+    X[:, col("name_equal")] = np.fromiter((float(x == y) if x and y else np.nan
+                                           for x, y in zip(a["name"], t["name"])), np.float32, n)
+    X[:, col("glued_equal")] = np.fromiter((float(x == y) if x and y else np.nan
+                                            for x, y in zip(a["glued"], t["glued"])), np.float32, n)
+    nt = _token_block(a["name"], t["name"], countries, "n", freq)
+    for j, f in enumerate(("name_jacc", "name_wov", "name_wshared_max", "name_wmiss_a", "name_wmiss_t")):
+        X[:, col(f)] = nt[:, j]
+
+    # addresses
+    X[:, col("addr_ratio")] = _masked_sim(a["addr"], t["addr"], fuzz.ratio, 100)
+    X[:, col("addr_tsort")] = _masked_sim(a["addr"], t["addr"], fuzz.token_sort_ratio, 100)
+    X[:, col("addr_tset")] = _masked_sim(a["addr"], t["addr"], fuzz.token_set_ratio, 100)
+    at = _token_block(a["addr"], t["addr"], countries, "a", freq)
+    for j, f in enumerate(("addr_jacc", "addr_wov", "addr_wshared_max")):
+        X[:, col(f)] = at[:, j]
+    aa = np.fromiter((len(x) for x in a["addr"]), np.float32, n)
+    ta = np.fromiter((len(x) for x in t["addr"]), np.float32, n)
+    X[:, col("addr_empty_a")], X[:, col("addr_empty_t")] = aa == 0, ta == 0
+    with np.errstate(invalid="ignore", divide="ignore"):
+        X[:, col("addr_len_ratio")] = np.where(np.minimum(aa, ta) > 0,
+                                               np.minimum(aa, ta) / np.maximum(aa, ta), np.nan)
+
+    # numbers
+    nb = _number_block(a["nums"], t["nums"])
+    for j, f in enumerate(("num_n_a", "num_n_t", "num_shared", "num_jacc", "num_first_equal",
+                           "num_conflict", "num_min_reldiff", "postal_equal", "postal_conflict")):
+        X[:, col(f)] = nb[:, j]
+
+    # script
+    X[:, col("indic_a")] = np.asarray(a["indic"], np.float32)
+    X[:, col("indic_t")] = np.asarray(t["indic"], np.float32)
+
+    # retrieval
+    ch = meta["channels"].astype(np.int64)
+    X[:, col("ret_score")] = meta["score"]
+    X[:, col("ret_rank")] = meta["rank"]
+    X[:, col("is_s3")] = meta["source"] == 3
+    bits = np.stack([(ch >> i) & 1 for i in range(len(CHANNELS))], axis=1)
+    X[:, col("n_channels")] = bits.sum(axis=1)
+    for i, c in enumerate(CHANNELS):
+        X[:, col(f"ch_{c}")] = bits[:, i]
+
+    # context: rivals of the same S1 record (both sources together)
+    g = meta["anchor"].astype(np.int64)
+    inv = np.unique(g, return_inverse=True)[1]
+    X[:, col("n_cands")] = np.bincount(inv)[inv]
+    X[:, col("ret_score_gap")], _ = _group_context(g, meta["score"])
+    X[:, col("name_tset_gap")], X[:, col("name_tset_lead")] = _group_context(g, X[:, col("name_tset")])
+    X[:, col("addr_tset_gap")], X[:, col("addr_tset_lead")] = _group_context(g, X[:, col("addr_tset")])
+    combo = np.nan_to_num(X[:, col("name_tset")]) + np.nan_to_num(X[:, col("addr_tset")])
+    order = np.lexsort((-combo, g))
+    starts = np.r_[0, np.flatnonzero(g[order][1:] != g[order][:-1]) + 1]
+    rank_sorted = np.arange(n) - np.repeat(starts, np.diff(np.r_[starts, n]))
+    combo_rank = np.empty(n, np.float32); combo_rank[order] = rank_sorted
+    X[:, col("combo_rank")] = combo_rank
+    return X
+
+
+def _pair_task(args):
+    a, t, countries, meta = args
+    return pair_block(a, t, countries, meta, _SHARED.get("freq"))
+
+
+def compute_features(
+    A: pd.DataFrame, T: pd.DataFrame, a_pos: np.ndarray, t_pos: np.ndarray,
+    countries: Sequence[str], meta: Dict[str, np.ndarray], freq: Optional[TokenFreq] = None,
+    workers: int = 0, block_pairs: int = 50_000, wave: int = 0,
+) -> np.ndarray:
+    """Features for many pairs, in anchor-aligned blocks, in parallel.
+
+    A / T: prepared tables (from prepare) for anchors and candidate targets.
+    a_pos / t_pos: row of each pair in A and T.  countries: anchor country per
+    pair.  meta: retrieval arrays per pair (see pair_block); pairs must be
+    grouped by meta['anchor'].
+
+    Blocks are sent to the pool in waves of `wave` blocks (default 2x workers)
+    so only a bounded amount of text is in flight at once.
+    """
+    n = len(a_pos)
+    anchor = meta["anchor"]
+    if n and np.any(anchor[1:] < anchor[:-1]):
+        raise ValueError("pairs must be grouped (sorted) by anchor")
+    # block boundaries on anchor changes
+    bounds, s = [], 0
+    while s < n:
+        e = min(s + block_pairs, n)
+        while e < n and anchor[e] == anchor[e - 1]:
+            e += 1
+        bounds.append((s, e)); s = e
+
+    def task(b):
+        s, e = b
+        a = {c: A[c].iloc[a_pos[s:e]].tolist() for c in PREP_COLUMNS}
+        t = {c: T[c].iloc[t_pos[s:e]].tolist() for c in PREP_COLUMNS}
+        return a, t, list(countries[s:e]), {k: v[s:e] for k, v in meta.items()}
+
+    X = np.empty((n, len(FEATURE_NAMES)), dtype=np.float32)
+    _SHARED["freq"] = freq
+    try:
+        if workers and workers > 1 and len(bounds) > 1:
+            wave = wave or 2 * workers
+            with get_context("fork").Pool(workers, initializer=_die_with_parent) as pool:
+                for w0 in range(0, len(bounds), wave):
+                    bs = bounds[w0:w0 + wave]
+                    for (s, e), part in zip(bs, pool.map(_pair_task, [task(b) for b in bs])):
+                        X[s:e] = part
+        else:
+            for b in bounds:
+                X[b[0]:b[1]] = _pair_task(task(b))
+    finally:
+        _SHARED.clear()
+    return X

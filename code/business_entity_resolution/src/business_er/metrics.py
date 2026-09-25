@@ -184,3 +184,48 @@ def blocking_report(
     if total_pairs:
         out["reduction_ratio"] = 1.0 - n_cand / total_pairs
     return out
+
+
+# --------------------------------------------------------------------------
+# vectorised form, for scoring millions of candidate pairs at many thresholds
+# --------------------------------------------------------------------------
+
+def entity_f05_counts(tp, fp, n_true):
+    """entity_f05 for many S1 records at once, from counts.
+
+    tp, fp  -- correct / wrong predicted matches per S1 record
+    n_true  -- ALL true matches of that record, including ones blocking never
+               proposed (they are misses, and must count as such)
+
+    Same singleton rule: n_true == 0 scores 1.0 iff nothing was predicted.
+    Tested against entity_f05 so the two can never disagree.
+    """
+    import numpy as np
+
+    tp = np.asarray(tp, dtype=np.float64)
+    fp = np.asarray(fp, dtype=np.float64)
+    n_true = np.asarray(n_true, dtype=np.float64)
+    if np.any(tp > n_true):
+        raise ValueError("tp exceeds n_true: labels and truth disagree")
+    fn = n_true - tp
+    denom = 1.25 * tp + fp + 0.25 * fn
+    with np.errstate(invalid="ignore", divide="ignore"):
+        score = np.where(denom > 0, 1.25 * tp / denom, 0.0)
+    return np.where(n_true == 0, (fp == 0).astype(np.float64), score)
+
+
+def macro_f05_at_threshold(anchor, label, score, n_true, threshold):
+    """Leaderboard score when every candidate with score >= threshold is kept.
+
+    anchor  -- per pair, the S1 row (0..len(n_true)-1)
+    label   -- per pair, 1 if the candidate is a true match
+    n_true  -- per S1 row; rows with no candidates at all still count
+    """
+    import numpy as np
+
+    keep = np.asarray(score) >= threshold
+    lab = np.asarray(label)
+    n = len(n_true)
+    tp = np.bincount(anchor[keep], weights=lab[keep], minlength=n)
+    fp = np.bincount(anchor[keep], weights=1 - lab[keep], minlength=n)
+    return float(entity_f05_counts(tp, fp, n_true).mean())

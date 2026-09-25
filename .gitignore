@@ -55,3 +55,6 @@ __MACOSX/
 .vscode/
 .idea/
 *.swp
+
+# organizer query form: contains other participants' personal data
+*.xlsx

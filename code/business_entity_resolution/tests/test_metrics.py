@@ -137,3 +137,41 @@ def test_singleton_with_candidates_still_reaches_one():
     rep = blocking_report({"S1-1": []}, {"S1-1": ["S2-1", "S2-2"]})
     assert rep["oracle_macro_f05"] == 1.0
     assert math.isnan(rep["full_coverage_rate"])
+
+
+# ---- vectorised scorer must agree with the reference one -----------------
+
+def test_counts_form_matches_reference():
+    import numpy as np
+    from business_er.metrics import entity_f05, entity_f05_counts
+
+    rng = np.random.default_rng(0)
+    for _ in range(2000):
+        n_true = int(rng.integers(0, 6))
+        truth = [f"T{i}" for i in range(n_true)]
+        tp = int(rng.integers(0, n_true + 1))
+        fp = int(rng.integers(0, 4))
+        pred = truth[:tp] + [f"F{i}" for i in range(fp)]
+        assert entity_f05_counts([tp], [fp], [n_true])[0] == pytest.approx(entity_f05(truth, pred))
+
+
+def test_macro_at_threshold_counts_blocking_misses():
+    import numpy as np
+    from business_er.metrics import macro_f05_at_threshold
+
+    # S1 row 0: 2 true matches, only one was ever a candidate
+    # S1 row 1: singleton with a wrong candidate scored low
+    # S1 row 2: no candidates at all, 1 true match -> 0
+    anchor = np.array([0, 0, 1])
+    label = np.array([1, 0, 0])
+    score = np.array([0.9, 0.2, 0.1])
+    n_true = np.array([2, 0, 1])
+    got = macro_f05_at_threshold(anchor, label, score, n_true, 0.5)
+    want = (1.25 / (1.25 + 0 + 0.25) + 1.0 + 0.0) / 3
+    assert got == pytest.approx(want)
+
+
+def test_counts_reject_impossible_input():
+    from business_er.metrics import entity_f05_counts
+    with pytest.raises(ValueError):
+        entity_f05_counts([3], [0], [2])

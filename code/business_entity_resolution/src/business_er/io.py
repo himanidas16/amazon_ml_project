@@ -289,3 +289,118 @@ def file_sha256(path: str | Path) -> str:
         for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def write_grouped_id_lists(
+    path: str | Path,
+    s1_ids: Sequence[str],
+    row,
+    codes,
+    column: str,
+    source_base: int = 2_000_000_000,
+) -> None:
+    """Streamed writer for the full test outputs.
+
+    Same contract as write_id_list_tsv, but the lists arrive as two flat
+    arrays -- row (index into s1_ids) and target code (source * source_base +
+    numeric id) -- instead of a dict of Python lists.  At ~86M candidate ids
+    a dict of strings would need several GB; here only one line exists at a
+    time.
+
+    Enforced: one row per S1 id in the given order, S2-/S3- ids only, no
+    duplicates inside a list, ids sorted as strings (byte-identical reruns),
+    a real empty field for empty lists.
+    """
+    import numpy as np
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if len(set(s1_ids)) != len(s1_ids):
+        raise ValueError("duplicate S1 ids passed to the writer")
+    row = np.asarray(row, dtype=np.int64)
+    codes = np.asarray(codes, dtype=np.int64)
+    if len(row) != len(codes):
+        raise ValueError("row and codes differ in length")
+    if len(row) and (row.min() < 0 or row.max() >= len(s1_ids)):
+        raise ValueError("row index outside the S1 id list")
+    src = codes // source_base
+    if len(src) and not np.isin(src, (2, 3)).all():
+        raise ValueError("a target is neither S2 nor S3")
+
+    order = np.lexsort((codes, row))
+    row, codes = row[order], codes[order]
+    dup = (row[1:] == row[:-1]) & (codes[1:] == codes[:-1])
+    if dup.any():
+        raise ValueError(f"{int(dup.sum())} duplicate ids inside a list")
+    bounds = np.searchsorted(row, np.arange(len(s1_ids) + 1))
+
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        f.write(f"source1_entity_id\t{column}\n")
+        for i, sid in enumerate(s1_ids):
+            if any(ch in sid for ch in "\t\n\r,"):
+                raise ValueError(f"S1 id {sid!r} contains a delimiter")
+            seg = codes[bounds[i]:bounds[i + 1]].tolist()
+            ids = sorted(f"S{c // source_base}-{c % source_base}" for c in seg)
+            f.write(f"{sid}\t{','.join(ids)}\n")
+
+
+def write_id_lists_by_group(
+    path: str | Path,
+    s1_ids: Sequence[str],
+    groups,
+    column: str,
+    source_base: int = 2_000_000_000,
+) -> None:
+    """Write an id-list file from per-group (e.g. per-country) pair arrays,
+    WITHOUT concatenating or sorting all pairs.
+
+    groups: iterable of (rows, anchor, codes) where
+        rows[j]   -- position in s1_ids of the group's j-th S1 record
+        anchor    -- per pair, j (must be non-decreasing: pairs grouped by S1)
+        codes     -- per pair, target code (source * source_base + id)
+
+    Each S1 line is assembled by jumping straight to its group's slice, so
+    memory stays at the size of the inputs.  (The concatenate-and-sort
+    writer needed several extra copies of 86M ids and hit the memory cap.)
+    Output is byte-identical to write_grouped_id_lists for the same pairs.
+    """
+    import numpy as np
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    n = len(s1_ids)
+    if len(set(s1_ids)) != n:
+        raise ValueError("duplicate S1 ids passed to the writer")
+    owner = np.full(n, -1, dtype=np.int32)
+    local = np.full(n, -1, dtype=np.int64)
+    segs = []
+    for g, (rows, anchor, codes) in enumerate(groups):
+        rows = np.asarray(rows, dtype=np.int64)
+        anchor = np.asarray(anchor, dtype=np.int64)
+        codes = np.asarray(codes, dtype=np.int64)
+        if len(anchor) != len(codes):
+            raise ValueError("anchor and codes differ in length")
+        if len(anchor) and (np.any(anchor[1:] < anchor[:-1]) or anchor[0] < 0 or anchor[-1] >= len(rows)):
+            raise ValueError("pairs must be grouped by anchor, with anchors inside the group")
+        if len(codes) and not np.isin(codes // source_base, (2, 3)).all():
+            raise ValueError("a target is neither S2 nor S3")
+        if np.any(owner[rows] >= 0):
+            raise ValueError("an S1 record belongs to two groups")
+        owner[rows] = g
+        local[rows] = np.arange(len(rows))
+        segs.append((np.searchsorted(anchor, np.arange(len(rows) + 1)), codes))
+
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        f.write(f"source1_entity_id\t{column}\n")
+        for i, sid in enumerate(s1_ids):
+            if any(ch in sid for ch in "\t\n\r,"):
+                raise ValueError(f"S1 id {sid!r} contains a delimiter")
+            ids = []
+            if owner[i] >= 0:
+                bounds, codes = segs[owner[i]]
+                j = local[i]
+                seg = codes[bounds[j]:bounds[j + 1]].tolist()
+                if len(set(seg)) != len(seg):
+                    raise ValueError(f"{sid}: duplicate ids inside its list")
+                ids = sorted(f"S{c // source_base}-{c % source_base}" for c in seg)
+            f.write(f"{sid}\t{','.join(ids)}\n")

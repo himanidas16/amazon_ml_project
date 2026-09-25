@@ -59,6 +59,15 @@ sarl sas sasu eurl sa gmbh
 www http https com net org info biz in fr us
 """.split())
 MIN_GLUED_LEN = 6
+
+
+def glued_name(folded_name: str) -> str:
+    """Name with legal/web tokens dropped and the rest glued into one word:
+    "VDR Cornerstone Pegasus LLC" and "vdrcornerstonepegasus.com" both give
+    "vdrcornerstonepegasus".  "" when the result is too short to be specific.
+    Shared by blocking (name_glued channel) and pair features."""
+    g = "".join(t for t in folded_name.split() if t not in _GLUE_DROP)
+    return g if len(g) >= MIN_GLUED_LEN else ""
 CHANNEL_BIT = {c: 1 << i for i, c in enumerate(CHANNELS)}
 
 # S2-100 and S3-100 both exist, so a target is identified by (source, value).
@@ -117,8 +126,8 @@ def make_keys(country: str, nf: str, ntok: List[str], atok: List[str],
     # "VDR Cornerstone Pegasus LLC" and "vdrcornerstonepegasus.com" share no
     # word, but glue to the same string.  Uses every name token (even 1-2
     # letter ones like the "s r k" of "S.R.K Traders").
-    glued = "".join(t for t in nf.split() if t not in _GLUE_DROP)
-    if len(glued) >= MIN_GLUED_LEN:
+    glued = glued_name(nf)
+    if glued:
         k["name_glued"].append(f"{c}|g|{glued}")
     return k
 

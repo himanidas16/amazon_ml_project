@@ -201,3 +201,69 @@ def test_written_file_parses_as_strict_tsv(tmp_path):
         rows = list(csv.reader(f, delimiter="\t", quoting=csv.QUOTE_NONE))
     assert all(len(r) == 2 for r in rows)
     assert '"' not in out.read_text(encoding="utf-8")
+
+
+# ---- streamed writer ------------------------------------------------------
+
+def test_grouped_writer_matches_dict_writer(tmp_path):
+    import numpy as np
+    from business_er.io import read_id_list_tsv, write_grouped_id_lists, write_id_list_tsv
+
+    s1 = ["S1-5", "S1-1", "S1-9"]
+    B = 2_000_000_000
+    row = np.array([0, 0, 2, 0])
+    codes = np.array([2 * B + 193, 3 * B + 812, 3 * B + 4, 2 * B + 47])
+    write_grouped_id_lists(tmp_path / "g.tsv", s1, row, codes, "matched_entity_ids")
+    write_id_list_tsv(tmp_path / "d.tsv", s1,
+                      {"S1-5": ["S2-193", "S3-812", "S2-47"], "S1-9": ["S3-4"]},
+                      "matched_entity_ids")
+    assert (tmp_path / "g.tsv").read_bytes() == (tmp_path / "d.tsv").read_bytes()
+    back = read_id_list_tsv(tmp_path / "g.tsv")
+    assert list(back) == s1 and back["S1-1"] == []           # empty row kept, order kept
+
+
+def test_grouped_writer_rejects_bad_input(tmp_path):
+    import numpy as np
+    from business_er.io import write_grouped_id_lists
+
+    B = 2_000_000_000
+    with pytest.raises(ValueError):          # duplicate inside a list
+        write_grouped_id_lists(tmp_path / "x.tsv", ["S1-1"], np.array([0, 0]),
+                               np.array([2 * B + 1, 2 * B + 1]), "c")
+    with pytest.raises(ValueError):          # an S1 target
+        write_grouped_id_lists(tmp_path / "x.tsv", ["S1-1"], np.array([0]), np.array([1 * B + 1]), "c")
+    with pytest.raises(ValueError):          # duplicate S1 row
+        write_grouped_id_lists(tmp_path / "x.tsv", ["S1-1", "S1-1"], np.array([], int),
+                               np.array([], int), "c")
+
+
+def test_group_writer_matches_sorting_writer(tmp_path):
+    import numpy as np
+    from business_er.io import write_grouped_id_lists, write_id_lists_by_group
+
+    B = 2_000_000_000
+    s1 = ["S1-5", "S1-1", "S1-9", "S1-7"]
+    # group A owns S1 rows 0 and 3; group B owns row 2; row 1 has nothing
+    ga = (np.array([0, 3]), np.array([0, 0, 1]), np.array([2 * B + 193, 3 * B + 812, 2 * B + 4]))
+    gb = (np.array([2]), np.array([0]), np.array([3 * B + 47]))
+    write_id_lists_by_group(tmp_path / "g.tsv", s1, [ga, gb], "c")
+    rows = np.r_[ga[0][ga[1]], gb[0][gb[1]]]
+    codes = np.r_[ga[2], gb[2]]
+    write_grouped_id_lists(tmp_path / "s.tsv", s1, rows, codes, "c")
+    assert (tmp_path / "g.tsv").read_bytes() == (tmp_path / "s.tsv").read_bytes()
+
+
+def test_group_writer_rejects_bad_input(tmp_path):
+    import numpy as np
+    from business_er.io import write_id_lists_by_group
+
+    B = 2_000_000_000
+    with pytest.raises(ValueError):   # duplicate id inside a list
+        write_id_lists_by_group(tmp_path / "x", ["S1-1"], [(np.array([0]), np.array([0, 0]),
+                                np.array([2 * B + 1, 2 * B + 1]))], "c")
+    with pytest.raises(ValueError):   # S1 record claimed by two groups
+        g = (np.array([0]), np.array([0]), np.array([2 * B + 1]))
+        write_id_lists_by_group(tmp_path / "x", ["S1-1"], [g, g], "c")
+    with pytest.raises(ValueError):   # pairs not grouped by anchor
+        write_id_lists_by_group(tmp_path / "x", ["S1-1", "S1-2"], [(np.array([0, 1]), np.array([1, 0]),
+                                np.array([2 * B + 1, 2 * B + 2]))], "c")
