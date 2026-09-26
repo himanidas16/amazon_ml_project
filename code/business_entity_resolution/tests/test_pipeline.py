@@ -103,3 +103,15 @@ def test_build_pairs_with_wide_selection(tmp_path):
         assert int(code % 2_000_000_000) not in fold0[int(code // 2_000_000_000)]
     rep = json.loads((out / "build_report.json").read_text())
     assert rep["k_wide"] == 20 and rep["train_pos"] > 0
+
+
+def test_build_pairs_with_extra_channels(tmp_path):
+    _dataset(tmp_path / "data")
+    art = tmp_path / "art"
+    quiet = lambda _: None
+    build_splits(tmp_path / "data", art, log=quiet)
+    train_token_freq(tmp_path / "data", art, workers=1, log=quiet)
+    out = build_pairs(tmp_path / "data", art, out_name="xch", train_anchors=60, val_anchors=15,
+                      k=2, k_wide=20, k_formula=2, extra_k=3, workers=1, log=quiet)
+    rep = json.loads((out / "build_report.json").read_text())
+    assert rep["extra_k"] == 3 and rep["train_pos"] > 0

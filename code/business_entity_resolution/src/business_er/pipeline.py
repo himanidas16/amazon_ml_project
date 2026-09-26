@@ -115,7 +115,7 @@ def build_pairs(
     data_dir, art_dir, out_name: str = "pairs", train_anchors: int = 100_000,
     val_anchors: int = 20_000, easy_rate: float = 1.0, cap: int = 3000, k: int = 25,
     batch: int = 100, workers: int = 6, anchors_per_chunk: int = 20_000,
-    val_world: bool = False, k_wide: int = 0, k_formula: int = 0, log=print,
+    val_world: bool = False, k_wide: int = 0, k_formula: int = 0, extra_k: int = 0, log=print,
 ) -> Path:
     """Blocking + labels + features for a sample of training and validation
     businesses, one country at a time, written as parquet parts.
@@ -194,7 +194,8 @@ def build_pairs(
             if not len(sel):
                 continue
             index = build_index(src, keep=not_fold0 if n == "train" else val_keep, country=ctry,
-                                freq=freq, workers=workers, keep_text=bool(k_wide > k and k_formula > 0))
+                                freq=freq, workers=workers, keep_text=bool(k_wide > k and k_formula > 0),
+                                extra=extra_k > 0)
             say(f"[{ctry}/{n}] index built: {index.n_targets:,} targets")
             if n == "train":   # leak guard, checked rather than assumed
                 for s in (2, 3):
@@ -203,7 +204,7 @@ def build_pairs(
                         raise RuntimeError("validation record in the training index")
             sub = a.iloc[sel]
             ak = compute_keys(sub["business_name"].tolist(), sub["business_address"].tolist(),
-                              sub["country"].tolist(), workers=workers, freq=freq)
+                              sub["country"].tolist(), workers=workers, freq=freq, extra=extra_k > 0)
             if k_wide > k and k_formula > 0:
                 sa = prepare(sub["business_name"].tolist(), sub["business_address"].tolist(),
                              workers=workers, countries=sub["country"].tolist())
@@ -212,7 +213,7 @@ def build_pairs(
                 c, cnt = select_candidates(index, ak, len(sel), sa["name"], sa["addr"],
                                            pool["name"], pool["addr"], cap=cap, k_keep=k,
                                            k_wide=k_wide, k_formula=k_formula, batch=batch,
-                                           workers=workers, log=say)
+                                           workers=workers, extra_k=extra_k, log=say)
                 del sa, pool
             else:
                 c = generate_candidates(index, ak, len(sel), cap=cap, k=k, batch=batch, workers=workers)
@@ -277,7 +278,7 @@ def build_pairs(
     stats["val_blocking_recall"] = stats["val_pos"] / max(n_true_val, 1)
     (out / "build_report.json").write_text(json.dumps({
         "train_anchors": train_anchors, "val_anchors": len(val_idx), "easy_rate": easy_rate,
-        "val_world": val_world, "k_wide": k_wide, "k_formula": k_formula,
+        "val_world": val_world, "k_wide": k_wide, "k_formula": k_formula, "extra_k": extra_k,
         "cap": cap, "k": k, **stats}, indent=2, default=_plain))
     say(f"train pairs {stats['train_all']:,} -> kept {stats['train_kept']:,}; "
         f"val pairs {stats['val']:,}, blocking recall {stats['val_blocking_recall']:.4f}")

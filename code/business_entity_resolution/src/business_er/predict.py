@@ -127,7 +127,7 @@ def run(
     workers: int = 6, batch: int = 100, anchors_per_chunk: int = 20_000,
     predict_threads: int = 12, log: Callable[[str], None] = print,
     stage2_path: str | Path | None = None, t2: float | None = None,
-    k_wide: int = 0, k_formula: int = 0,
+    k_wide: int = 0, k_formula: int = 0, extra_k: int = 0,
 ) -> Dict[str, dict]:
     """stage2_path: optional stage-2 LightGBM model (see stage2.py).  When
     given, the stage-1 features stage 2 needs are saved per pair, and the
@@ -151,6 +151,7 @@ def run(
         "features_version": FEATURES_VERSION, "predict_version": PREDICT_VERSION,
         "stores_stage2_inputs": stage2 is not None,
         "k_wide": k_wide, "k_formula": k_formula, "select_version": SELECT_VERSION,
+        "extra_k": extra_k,
     })
     t0 = time.time()
     say = lambda m: log(f"[{time.time() - t0:7.1f}s] {m}")
@@ -181,10 +182,10 @@ def run(
             say(f"[{ctry}] loaded blocking from {cpath.name}")
         else:
             index = build_index(src, country=ctry, freq=freq, workers=workers,
-                                keep_text=bool(k_wide > k and k_formula > 0))
+                                keep_text=bool(k_wide > k and k_formula > 0), extra=extra_k > 0)
             say(f"[{ctry}] index built: {index.n_targets:,} targets")
             ak = compute_keys(a["business_name"].tolist(), a["business_address"].tolist(),
-                              a["country"].tolist(), workers=workers, freq=freq)
+                              a["country"].tolist(), workers=workers, freq=freq, extra=extra_k > 0)
             if k_wide > k and k_formula > 0:
                 # wide retrieval + fixed-formula re-selection (select.py)
                 sa = prepare(a["business_name"].tolist(), a["business_address"].tolist(),
@@ -193,7 +194,8 @@ def run(
                 c, counts = select_candidates(index, ak, len(sel), sa["name"], sa["addr"],
                                               pool["name"], pool["addr"], cap=cap, k_keep=k,
                                               k_wide=k_wide, k_formula=k_formula, batch=batch,
-                                              workers=workers, threads=predict_threads, log=say)
+                                              workers=workers, threads=predict_threads,
+                                              extra_k=extra_k, log=say)
                 del sa, pool
             else:
                 c = generate_candidates(index, ak, len(sel), cap=cap, k=k, batch=batch, workers=workers)

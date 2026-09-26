@@ -42,12 +42,21 @@ import pandas as pd
 from .io import iter_source
 from .normalize import address_views, expand_address_tokens, name_views
 
-RETRIEVE_VERSION = "1.4.0"   # 1.1 leading zeros; 1.2 rarest tokens; 1.3 name_glued channel
+RETRIEVE_VERSION = "1.5.0"   # 1.5: optional extra address channels   # 1.1 leading zeros; 1.2 rarest tokens; 1.3 name_glued channel
 
 CHANNELS: Tuple[str, ...] = (
     "name_exact", "name_sorted", "name_token", "name_pair",
     "addr_token", "num_token", "num_set", "name_num", "name_glued", "addr_exact",
 )
+# Optional channels (build with extra=True), measured on 20k validation
+# businesses as additions to the selected candidates: ceiling 0.9880 -> 0.9905.
+# They target true matches whose street numbers were truncated or altered
+# ("403" vs "40", "D-199" vs "D-99") and generic names outranked by look-alikes.
+#   addr_pair   pairs among the 3 rarest address tokens (numbers ignored)
+#   addr_nonum  the whole cleaned address with number tokens removed
+#   num_trunc   first 2 digits of each 3+-digit number + rarest address token
+EXTRA_CHANNELS = ("addr_pair", "addr_nonum", "num_trunc")
+ALL_CHANNELS = CHANNELS + EXTRA_CHANNELS
 # Channels whose group size is also a feature: how many records in the pool
 # carry exactly this cleaned name / address.  A name or address used by one
 # record is strong evidence; one shared by an office building or a chain is not.
@@ -73,7 +82,7 @@ def glued_name(folded_name: str) -> str:
     Shared by blocking (name_glued channel) and pair features."""
     g = "".join(t for t in folded_name.split() if t not in _GLUE_DROP)
     return g if len(g) >= MIN_GLUED_LEN else ""
-CHANNEL_BIT = {c: 1 << i for i, c in enumerate(CHANNELS)}
+CHANNEL_BIT = {c: 1 << i for i, c in enumerate(CHANNELS + ("addr_pair", "addr_nonum", "num_trunc"))}
 
 # S2-100 and S3-100 both exist, so a target is identified by (source, value).
 SOURCE_BASE = 2_000_000_000
@@ -106,7 +115,7 @@ def parse_record(name: str, address: str) -> Tuple[str, List[str], List[str], Li
 
 
 def make_keys(country: str, nf: str, ntok: List[str], atok: List[str],
-              nums: List[str], af: str = "") -> Dict[str, List[str]]:
+              nums: List[str], af: str = "", extra: bool = False) -> Dict[str, List[str]]:
     """The blocking keys of one record, grouped by channel.
 
     ntok / atok must already be in PRIORITY order (rarest first when a token
@@ -136,6 +145,13 @@ def make_keys(country: str, nf: str, ntok: List[str], atok: List[str],
         k["name_glued"].append(f"{c}|g|{glued}")
     if len(af) >= MIN_EXACT_ADDR_LEN:
         k["addr_exact"].append(f"{c}|x|{af}")
+    if extra:
+        r3 = sorted(atok[:3])
+        k["addr_pair"] = [f"{c}|ap|{r3[i]}|{r3[j]}" for i in range(len(r3)) for j in range(i + 1, len(r3))]
+        nonum = " ".join(sorted({t for t in af.split() if not any(ch.isdigit() for ch in t)}))
+        k["addr_nonum"] = [f"{c}|an|{nonum}"] if len(nonum) >= 10 else []
+        k["num_trunc"] = ([f"{c}|nt|{n[:2]}|{atok[0]}" for n in sorted({n for n in nums if len(n) >= 3})[:3]]
+                          if atok else [])
     return k
 
 
@@ -277,7 +293,7 @@ KeyChunk = Dict[str, Tuple[np.ndarray, np.ndarray]]   # channel -> (hash, local 
 
 
 def keys_for_rows(names: Sequence[str], addrs: Sequence[str], countries: Sequence[str],
-                  freq: Optional[TokenFreq] = None) -> dict:
+                  freq: Optional[TokenFreq] = None, extra: bool = False) -> dict:
     """Keys for a block of records, as flat (hash, row) arrays per channel.
 
     With a frequency table, all tokens of the block are looked up in ONE
@@ -300,10 +316,11 @@ def keys_for_rows(names: Sequence[str], addrs: Sequence[str], countries: Sequenc
                             _by_rarity(atok, cnt[s0 + k:s0 + k + len(atok)]), nums, af))
         parsed = ordered
 
-    buf: Dict[str, Tuple[List[str], List[int]]] = {ch: ([], []) for ch in CHANNELS}
+    active = ALL_CHANNELS if extra else CHANNELS
+    buf: Dict[str, Tuple[List[str], List[int]]] = {ch: ([], []) for ch in active}
     raw = []
     for row, ((nf, ntok, atok, nums, af), c) in enumerate(zip(parsed, countries)):
-        rk = make_keys(c, nf, ntok, atok, nums, af)
+        rk = make_keys(c, nf, ntok, atok, nums, af, extra=extra)
         raw.append(rk)
         for ch, ks in rk.items():
             if ks:
@@ -337,8 +354,9 @@ _FREQ: dict = {}   # frequency table shared with forked workers (read-only)
 
 def _keys_task(args):
     start, names, addrs, countries = args
-    out = keys_for_rows(names, addrs, countries, _FREQ.get("freq"))
-    res = {ch: (out[ch][0], out[ch][1] + np.int32(start)) for ch in CHANNELS}
+    extra = bool(_FREQ.get("extra"))
+    out = keys_for_rows(names, addrs, countries, _FREQ.get("freq"), extra=extra)
+    res = {ch: (out[ch][0], out[ch][1] + np.int32(start)) for ch in (ALL_CHANNELS if extra else CHANNELS)}
     if _FREQ.get("keep_text"):
         res["_text"] = out["_text"]
     return start, res
@@ -347,7 +365,7 @@ def _keys_task(args):
 def compute_keys(
     names: Sequence[str], addrs: Sequence[str], countries: Sequence[str],
     workers: int = 0, chunk: int = 20_000, freq: Optional[TokenFreq] = None,
-    keep_text: bool = False,
+    keep_text: bool = False, extra: bool = False,
 ) -> KeyChunk:
     """keys_for_rows over many records, in parallel.  Rows keep their order.
 
@@ -359,6 +377,7 @@ def compute_keys(
              for s in range(0, n, chunk)]
     _FREQ["freq"] = freq
     _FREQ["keep_text"] = keep_text
+    _FREQ["extra"] = extra
     try:
         if workers and workers > 1 and len(tasks) > 1:
             with get_context("fork").Pool(workers, initializer=_die_with_parent) as pool:
@@ -371,7 +390,7 @@ def compute_keys(
     out = {
         ch: (np.concatenate([p[1][ch][0] for p in parts]) if parts else np.empty(0, np.uint64),
              np.concatenate([p[1][ch][1] for p in parts]) if parts else np.empty(0, np.int32))
-        for ch in CHANNELS
+        for ch in (ALL_CHANNELS if extra else CHANNELS)
     }
     if keep_text:
         out["_text"] = pd.DataFrame({
@@ -418,6 +437,7 @@ def build_index(
     workers: int = 0,
     read_chunk: int = 400_000,
     keep_text: bool = False,
+    extra: bool = False,
     log: Callable[[str], None] = lambda m: None,
 ) -> KeyIndex:
     """Index the S2/S3 files, streaming them in chunks.
@@ -430,8 +450,9 @@ def build_index(
     a key -- sharding by country gives IDENTICAL candidates at a fraction of the
     peak memory.  Any label works (open set); None indexes everything.
     """
-    key_parts: Dict[str, List[np.ndarray]] = {ch: [] for ch in CHANNELS}
-    row_parts: Dict[str, List[np.ndarray]] = {ch: [] for ch in CHANNELS}
+    active = ALL_CHANNELS if extra else CHANNELS
+    key_parts: Dict[str, List[np.ndarray]] = {ch: [] for ch in active}
+    row_parts: Dict[str, List[np.ndarray]] = {ch: [] for ch in active}
     code_parts: List[np.ndarray] = []
     text_parts: List[pd.DataFrame] = []
     offset = 0
@@ -448,10 +469,11 @@ def build_index(
             if not len(df):
                 continue
             kc = compute_keys(df["business_name"].tolist(), df["business_address"].tolist(),
-                              df["country"].tolist(), workers=workers, freq=freq, keep_text=keep_text)
+                              df["country"].tolist(), workers=workers, freq=freq, keep_text=keep_text,
+                              extra=extra)
             if keep_text:
                 text_parts.append(kc["_text"])
-            for ch in CHANNELS:
+            for ch in active:
                 key_parts[ch].append(kc[ch][0])
                 row_parts[ch].append(kc[ch][1] + np.int32(offset))
             code_parts.append(target_code(source, values))
@@ -459,7 +481,7 @@ def build_index(
             log(f"indexed S{source}{'' if country is None else ' ' + country}: {offset:,} targets")
 
     keys, rows = {}, {}
-    for ch in CHANNELS:
+    for ch in active:
         k = np.concatenate(key_parts[ch]) if key_parts[ch] else np.empty(0, np.uint64)
         r = np.concatenate(row_parts[ch]) if row_parts[ch] else np.empty(0, np.int32)
         key_parts[ch] = row_parts[ch] = None
@@ -580,7 +602,7 @@ def generate_candidates(
     measure each channel's contribution.
     """
     use = tuple(CHANNELS if channels is None else channels)
-    unknown = set(use) - set(CHANNELS)
+    unknown = set(use) - set(ALL_CHANNELS)
     if unknown:
         raise ValueError(f"unknown channels {sorted(unknown)}")
     _Q.update(index=index, akeys=anchor_keys, cap=cap, k=k, channels=use)

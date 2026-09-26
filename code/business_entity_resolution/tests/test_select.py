@@ -72,3 +72,41 @@ def test_index_text_equals_prepared_pool(tmp_path):
     b = prepare_pool(paths, plain, workers=1)              # separate pass
     assert a["name"].tolist() == b["name"].tolist() and a["addr"].tolist() == b["addr"].tolist()
     assert "rue" in a["addr"].iloc[1].split()             # France table applied
+
+
+# ---- optional extra address channels ------------------------------------------
+
+def test_extra_keys_only_when_enabled():
+    from business_er.retrieve import EXTRA_CHANNELS, record_keys, keys_for_rows
+    plain = keys_for_rows(["Eye Group"], ["403 8th Street, Buckeye, AZ"], ["US"])
+    extra = keys_for_rows(["Eye Group"], ["403 8th Street, Buckeye, AZ"], ["US"], extra=True)
+    assert not any(ch in plain for ch in EXTRA_CHANNELS)
+    for ch in EXTRA_CHANNELS:
+        assert ch in extra
+    raw = extra["_raw"][0]
+    assert any("|nt|40|" in k for k in raw["num_trunc"])          # 403 -> "40" + rare word
+    assert raw["addr_nonum"] and not any(c.isdigit() for c in raw["addr_nonum"][0].split("|an|")[1])
+
+
+def test_extra_selection_is_normal_selection_plus_channel_tops(tmp_path):
+    from business_er.retrieve import EXTRA_CHANNELS
+    rows = [(f"S2-{i}", f"Eye Group {i % 5}", f"{400 + i} Kerrigan Buckeye Lane, AZ", "US") for i in range(1, 40)]
+    rows += [(f"S2-{100 + i}", f"Shop {i}", f"{i} Kerrigan Buckeye Lane", "US") for i in range(1, 20)]
+    paths = {2: _write(tmp_path / "s2.tsv", rows)}
+    anchors = [("Eye Group", "403 Kerrigan Buckeye Lane, AZ", "US"), ("Shop 7", "7 Kerrigan Lane", "US")]
+    n, a, c = zip(*anchors)
+    A = prepare(list(n), list(a), countries=list(c))
+    idx = build_index(paths, extra=True, keep_text=True)
+    ak = compute_keys(list(n), list(a), list(c), extra=True)
+    T = prepare_pool(paths, idx)
+    kw = dict(k_keep=2, k_wide=6, k_formula=1, workers=1, threads=1)
+    base, _ = select_candidates(idx, ak, 2, A["name"], A["addr"], T["name"], T["addr"], **kw)
+    more, cnt = select_candidates(idx, ak, 2, A["name"], A["addr"], T["name"], T["addr"], extra_k=2, **kw)
+    pairs = lambda cand: set(zip(cand.anchor.tolist(), cand.target.tolist()))
+    want = pairs(base)
+    for ch in EXTRA_CHANNELS:
+        want |= pairs(generate_candidates(idx, ak, 2, k=2, channels=[ch]))
+    assert pairs(more) == want
+    assert len(pairs(more)) == len(more)                  # no duplicate pairs
+    assert len(cnt["t_addr_cnt"]) == len(more)
+    assert (np.diff(more.anchor) >= 0).all()             # still grouped by business

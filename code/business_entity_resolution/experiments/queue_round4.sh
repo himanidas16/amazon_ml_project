@@ -53,7 +53,7 @@ fi
 echo "[q4] predict extra: ${EXTRA:-none}"
 step predict output_v3/matching_results.tsv \
   $RUN -m business_er predict --data-dir $DATA --split test --model artifacts/models/matcher_sel_300k.lgb \
-       --freq artifacts/token_freq_test.npz --output-dir output_v3 --work-dir artifacts/test_work_v3 \
+       --freq artifacts/token_freq_test.npz --output-dir output_v3 --work-dir artifacts/test_work_v3b \
        --workers 4 --threshold $T1 $SEL $EXTRA
 $RUN --max-gb 3 code/business_entity_resolution/experiments/check_submission.py output_v3 $DATA/test \
   > $LOG/check_v3.log 2>&1

@@ -25,9 +25,10 @@ import numpy as np
 import pandas as pd
 from rapidfuzz import fuzz, process
 
-from .retrieve import SOURCE_BASE, Candidates, KeyChunk, KeyIndex, generate_candidates, pair_counts
+from .retrieve import (EXTRA_CHANNELS, SOURCE_BASE, Candidates, KeyChunk, KeyIndex,
+                       generate_candidates, pair_counts)
 
-SELECT_VERSION = "1.0.0"
+SELECT_VERSION = "1.1.0"   # 1.1: optional per-channel quotas for the extra channels
 
 
 def slice_keys(akeys: KeyChunk, lo: int, hi: int) -> KeyChunk:
@@ -47,7 +48,7 @@ def _tset(a: List[str], t: List[str], threads: int) -> np.ndarray:
 
 def formula_score(a_name: pd.Series, a_addr: pd.Series, t_name: pd.Series, t_addr: pd.Series,
                   a_pos: np.ndarray, t_pos: np.ndarray, ret_score: np.ndarray,
-                  chunk: int = 2_000_000, threads: int = 6) -> np.ndarray:
+                  chunk: int = 500_000, threads: int = 6) -> np.ndarray:
     """Mean of the PRESENT name/address token-set similarities (0 if both
     missing), plus a tiny blocking-score tiebreak."""
     n = len(a_pos)
@@ -67,8 +68,8 @@ def select_candidates(
     index: KeyIndex, akeys: KeyChunk, n_anchors: int,
     a_name: pd.Series, a_addr: pd.Series, t_name: pd.Series, t_addr: pd.Series,
     cap: int = 3000, k_keep: int = 25, k_wide: int = 150, k_formula: int = 10,
-    batch: int = 100, workers: int = 6, threads: int = 6, anchors_per_range: int = 50_000,
-    log=lambda m: None,
+    batch: int = 100, workers: int = 6, threads: int = 6, anchors_per_range: int = 25_000,
+    extra_k: int = 0, log=lambda m: None,
 ):
     """Selected candidates + their pool counts.
 
@@ -95,20 +96,62 @@ def select_candidates(
         frank = np.empty(len(o), np.int64)
         frank[o] = np.arange(len(o)) - np.repeat(starts, np.diff(np.r_[starts, len(o)]))
         keep = (c.rank < k_keep) | (frank < k_formula)
-        cnt = pair_counts(index, ak, c.anchor[keep], c.target[keep], hi - lo)
-        parts.append((a_glob[keep].astype(np.int32), c.target[keep], c.score[keep],
-                      c.channels[keep], c.rank[keep], cnt))
-        log(f"selected anchors {hi:,}/{n_anchors:,}: {len(c):,} wide -> {int(keep.sum()):,} kept")
+        anc, tgt = c.anchor[keep], c.target[keep]
+        sco, chb, rnk = c.score[keep], c.channels[keep], c.rank[keep]
+        if extra_k and all(ch in index.keys for ch in EXTRA_CHANNELS):
+            # each extra channel adds its own top extra_k per source (as measured)
+            n_t = index.n_targets
+            code = anc.astype(np.int64) * n_t + tgt
+            for ch in EXTRA_CHANNELS:
+                e = generate_candidates(index, ak, hi - lo, cap=cap, k=extra_k, batch=batch,
+                                        workers=workers, channels=[ch])
+                ecode = e.anchor.astype(np.int64) * n_t + e.target
+                pos = np.searchsorted(np.sort(code), ecode)
+                sc = np.sort(code)
+                dup = (pos < len(sc)) & (sc[np.minimum(pos, len(sc) - 1)] == ecode)
+                # already selected: just add this channel's flag
+                if dup.any():
+                    o = np.argsort(code)
+                    chb = chb.copy()
+                    chb[o[pos[dup]]] |= e.channels[dup]
+                new = ~dup
+                anc = np.r_[anc, e.anchor[new]]
+                tgt = np.r_[tgt, e.target[new]]
+                sco = np.r_[sco, e.score[new]]
+                chb = np.r_[chb, e.channels[new]]
+                rnk = np.r_[rnk, np.full(int(new.sum()), k_wide, rnk.dtype)]   # "beyond the wide list"
+                code = anc.astype(np.int64) * n_t + tgt
+            src = (index.codes[tgt] // SOURCE_BASE).astype(np.int64)
+            o = np.lexsort((tgt, -sco, src, anc))
+            anc, tgt, sco, chb, rnk = anc[o], tgt[o], sco[o], chb[o], rnk[o]
+        cnt = pair_counts(index, ak, anc, tgt, hi - lo)
+        parts.append(((anc.astype(np.int64) + lo).astype(np.int32), tgt.astype(np.int32),
+                      sco.astype(np.float32), chb, rnk,
+                      {k: v.astype(np.float32) for k, v in cnt.items()}))
+        log(f"selected anchors {hi:,}/{n_anchors:,}: {len(c):,} wide -> {len(anc):,} kept")
     if not parts:
         e = np.empty(0, np.int32)
         return (Candidates(e, e, np.empty(0, np.float32), np.empty(0, np.uint16), np.empty(0, np.int16)),
                 {k: np.empty(0, np.float32) for k in ("t_name_cnt", "t_addr_cnt", "a_name_cnt", "a_addr_cnt")})
-    cand = Candidates(
-        anchor=np.concatenate([p[0] for p in parts]), target=np.concatenate([p[1] for p in parts]),
-        score=np.concatenate([p[2] for p in parts]), channels=np.concatenate([p[3] for p in parts]),
-        rank=np.concatenate([p[4] for p in parts]),
-    )
-    counts = {k: np.concatenate([p[5][k] for p in parts]) for k in parts[0][5]}
+    # Join one column at a time and free each range's piece as soon as it is
+    # copied: joining everything at once briefly doubled memory (India, 48M
+    # selected pairs, ran out of memory there).
+    parts = [list(p[:5]) + [dict(p[5])] for p in parts]
+
+    def take(i, key=None):
+        out = np.concatenate([p[i] if key is None else p[i][key] for p in parts])
+        for p in parts:
+            if key is None:
+                p[i] = None
+            else:
+                del p[i][key]
+        return out
+
+    count_keys = list(parts[0][5])
+    fields = [take(i) for i in range(5)]
+    counts = {k: take(5, k) for k in count_keys}
+    cand = Candidates(anchor=fields[0], target=fields[1], score=fields[2], channels=fields[3],
+                      rank=fields[4])
     return cand, counts
 
 

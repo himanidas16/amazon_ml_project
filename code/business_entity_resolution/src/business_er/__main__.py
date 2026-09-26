@@ -36,6 +36,8 @@ def main(argv=None) -> int:
     p.add_argument("--predict-threads", type=int, default=12)
     p.add_argument("--k-wide", type=int, default=0, help="wide retrieval depth per source (0 = off)")
     p.add_argument("--k-formula", type=int, default=0, help="extra formula-selected candidates per source")
+    p.add_argument("--extra-k", type=int, default=0,
+                   help="top-k per source from EACH extra address channel (0 = off)")
     p.add_argument("--stage2-model", default=None, help="optional stage-2 model (competing claims)")
     p.add_argument("--stage2-threshold", type=float, default=None)
 
@@ -65,6 +67,7 @@ def main(argv=None) -> int:
     bp.add_argument("--workers", type=int, default=6)
     bp.add_argument("--k-wide", type=int, default=0)
     bp.add_argument("--k-formula", type=int, default=0)
+    bp.add_argument("--extra-k", type=int, default=0)
     bp.add_argument("--val-world", action="store_true",
                     help="all fold-0 businesses vs fold-0 records only (complete competition)")
 
@@ -112,7 +115,7 @@ def main(argv=None) -> int:
         build_pairs(args.data_dir, args.artifacts, out_name=args.out_name,
                     train_anchors=args.train_anchors, val_anchors=args.val_anchors,
                     easy_rate=args.easy_rate, workers=args.workers, val_world=args.val_world,
-                    k_wide=args.k_wide, k_formula=args.k_formula,
+                    k_wide=args.k_wide, k_formula=args.k_formula, extra_k=args.extra_k,
                     log=say)
         return 0
     if args.cmd == "train":
@@ -139,7 +142,7 @@ def main(argv=None) -> int:
             cap=args.cap, k=args.k, t=args.threshold, use_one_owner=not args.no_one_owner,
             workers=args.workers, predict_threads=args.predict_threads,
             stage2_path=args.stage2_model, t2=args.stage2_threshold,
-            k_wide=args.k_wide, k_formula=args.k_formula,
+            k_wide=args.k_wide, k_formula=args.k_formula, extra_k=args.extra_k,
             log=lambda m: print(m, flush=True),
         )
         print(json.dumps(summary, indent=2))
