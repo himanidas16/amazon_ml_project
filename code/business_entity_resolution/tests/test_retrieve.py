@@ -223,3 +223,33 @@ def test_glued_key_skips_short_or_generic_names():
     assert record_keys("ABC Ltd", "", "US")["name_glued"] == []        # "abc" too short
     assert record_keys("Private Limited", "", "US")["name_glued"] == []
     assert record_keys("Blue Heron", "", "US")["name_glued"] != record_keys("Blue Herons", "", "US")["name_glued"]
+
+
+# ---- exact-address channel and pool counts -------------------------------
+
+def test_addr_exact_channel_and_counts(tmp_path):
+    from business_er.retrieve import pair_counts
+    rows = [("S2-1", "Irilyragild", "WS 2, Cabin 1, No. 13-14, SV Complex, Bangalore", "India"),
+            ("S2-2", "Tower Shop A", "1 Big Tower, MG Road, Bangalore", "India"),
+            ("S2-3", "Tower Shop B", "1 Big Tower, MG Road, Bangalore", "India"),
+            ("S2-4", "Tower Shop C", "1 Big Tower, MG Road, Bangalore", "India"),
+            ("S2-5", "", "", "India")]
+    idx = build_index({2: _write(tmp_path / "s2.tsv", rows)})
+    anchors = [("Taiba Hospital", "Ws 2, Cabin 1, No. 13-14, Sv Complex, Bangalore", "India"),
+               ("Tower Shop A", "1 Big Tower, MG Road, Bangalore", "India")]
+    c, ids = _query(idx, anchors)
+    assert "S2-1" in ids[0]                         # found via the identical address alone
+    names, addrs, ctry = zip(*anchors)
+    ak = compute_keys(list(names), list(addrs), list(ctry))
+    cnt = pair_counts(idx, ak, c.anchor, c.target, len(anchors))
+    tid = {i: pos for pos, i in enumerate(idx.codes.tolist())}
+    for j in range(len(c)):
+        code = int(idx.codes[c.target[j]] % 2_000_000_000)
+        if code == 1 and c.anchor[j] == 0:
+            assert cnt["t_addr_cnt"][j] == 1 and cnt["a_addr_cnt"][j] == 1     # unique address
+        if c.anchor[j] == 1:
+            assert cnt["a_addr_cnt"][j] == 3 and cnt["a_name_cnt"][j] == 1     # its building is shared
+        if code in (2, 3, 4):
+            assert cnt["t_addr_cnt"][j] == 3                                      # shared building
+    assert idx.row_counts["addr_exact"][tid[2 * 2_000_000_000 + 5]] == 0          # blank: no key
+    assert "S2-5" not in ids[0] + ids[1]

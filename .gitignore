@@ -58,3 +58,7 @@ __MACOSX/
 
 # organizer query form: contains other participants' personal data
 *.xlsx
+
+# archives prepared for teammates (large, contain competition data)
+share_for_team/
+output_v*/

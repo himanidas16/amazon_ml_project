@@ -40,14 +40,19 @@ import numpy as np
 import pandas as pd
 
 from .io import iter_source
-from .normalize import address_views, name_views
+from .normalize import address_views, expand_address_tokens, name_views
 
-RETRIEVE_VERSION = "1.3.0"   # 1.1 leading zeros; 1.2 rarest tokens; 1.3 name_glued channel
+RETRIEVE_VERSION = "1.4.0"   # 1.1 leading zeros; 1.2 rarest tokens; 1.3 name_glued channel
 
 CHANNELS: Tuple[str, ...] = (
     "name_exact", "name_sorted", "name_token", "name_pair",
-    "addr_token", "num_token", "num_set", "name_num", "name_glued",
+    "addr_token", "num_token", "num_set", "name_num", "name_glued", "addr_exact",
 )
+# Channels whose group size is also a feature: how many records in the pool
+# carry exactly this cleaned name / address.  A name or address used by one
+# record is strong evidence; one shared by an office building or a chain is not.
+COUNT_CHANNELS = ("name_exact", "addr_exact")
+MIN_EXACT_ADDR_LEN = 8   # shorter addresses ("delhi") are too generic to be a key
 
 # Dropped before gluing a name into one word (name_glued channel).  Only
 # unambiguous legal forms -- NOT "enterprises"/"services", which are often the
@@ -88,7 +93,7 @@ def target_code(source: int | np.ndarray, value: int | np.ndarray):
 # keys
 # --------------------------------------------------------------------------
 
-def parse_record(name: str, address: str) -> Tuple[str, List[str], List[str], List[str]]:
+def parse_record(name: str, address: str) -> Tuple[str, List[str], List[str], List[str], str]:
     """(folded name, name tokens, address tokens, numbers) -- the raw material
     of every key.  Tokens are de-duplicated; order is decided later."""
     nv, av = name_views(name), address_views(address)
@@ -97,11 +102,11 @@ def parse_record(name: str, address: str) -> Tuple[str, List[str], List[str], Li
     atok = sorted({t for t in af.split() if len(t) >= 4 and not t.isdigit()})
     # "09585" and "9585" are the same street number; sources disagree on padding
     nums = sorted({n.lstrip("0") or "0" for n in av["numbers"].split()})
-    return nf, ntok, atok, nums
+    return nf, ntok, atok, nums, af
 
 
 def make_keys(country: str, nf: str, ntok: List[str], atok: List[str],
-              nums: List[str]) -> Dict[str, List[str]]:
+              nums: List[str], af: str = "") -> Dict[str, List[str]]:
     """The blocking keys of one record, grouped by channel.
 
     ntok / atok must already be in PRIORITY order (rarest first when a token
@@ -129,6 +134,8 @@ def make_keys(country: str, nf: str, ntok: List[str], atok: List[str],
     glued = glued_name(nf)
     if glued:
         k["name_glued"].append(f"{c}|g|{glued}")
+    if len(af) >= MIN_EXACT_ADDR_LEN:
+        k["addr_exact"].append(f"{c}|x|{af}")
     return k
 
 
@@ -191,7 +198,7 @@ def _count_task(args) -> Tuple[np.ndarray, np.ndarray]:
     names, addrs, countries = args
     strs: List[str] = []
     for n, a, c in zip(names, addrs, countries):
-        _, ntok, atok, _ = parse_record(n, a)
+        _, ntok, atok, _, _ = parse_record(n, a)
         strs += [f"n|{c}|{t}" for t in ntok] + [f"a|{c}|{t}" for t in atok]
         strs += [f"n|*|{t}" for t in ntok] + [f"a|*|{t}" for t in atok]
     h, cnt = np.unique(stable_hash(strs), return_counts=True)
@@ -281,22 +288,22 @@ def keys_for_rows(names: Sequence[str], addrs: Sequence[str], countries: Sequenc
     parsed = [parse_record(n, a) for n, a in zip(names, addrs)]
     if freq is not None:
         strs, bounds = [], []
-        for (nf, ntok, atok, _), c in zip(parsed, countries):
+        for (nf, ntok, atok, _, _), c in zip(parsed, countries):
             s0 = len(strs)
             strs += _freq_strings(c, ntok, atok, freq.countries)
             bounds.append(s0)
         cnt = freq.lookup(strs)
         ordered = []
-        for (nf, ntok, atok, nums), s0 in zip(parsed, bounds):
+        for (nf, ntok, atok, nums, af), s0 in zip(parsed, bounds):
             k = len(ntok)
             ordered.append((nf, _by_rarity(ntok, cnt[s0:s0 + k]),
-                            _by_rarity(atok, cnt[s0 + k:s0 + k + len(atok)]), nums))
+                            _by_rarity(atok, cnt[s0 + k:s0 + k + len(atok)]), nums, af))
         parsed = ordered
 
     buf: Dict[str, Tuple[List[str], List[int]]] = {ch: ([], []) for ch in CHANNELS}
     raw = []
-    for row, ((nf, ntok, atok, nums), c) in enumerate(zip(parsed, countries)):
-        rk = make_keys(c, nf, ntok, atok, nums)
+    for row, ((nf, ntok, atok, nums, af), c) in enumerate(zip(parsed, countries)):
+        rk = make_keys(c, nf, ntok, atok, nums, af)
         raw.append(rk)
         for ch, ks in rk.items():
             if ks:
@@ -304,6 +311,10 @@ def keys_for_rows(names: Sequence[str], addrs: Sequence[str], countries: Sequenc
                 buf[ch][1].extend([row] * len(ks))
     out: dict = {ch: (stable_hash(ks), np.asarray(rs, dtype=np.int32)) for ch, (ks, rs) in buf.items()}
     out["_raw"] = raw
+    # the cleaned name and expanded address, identical to features.prepare's
+    # "name"/"addr" columns -- kept so the selection formula needs no second pass
+    out["_text"] = ([p[0] for p in parsed],
+                    [expand_address_tokens(p[4], c) for p, c in zip(parsed, countries)])
     return out
 
 
@@ -327,12 +338,16 @@ _FREQ: dict = {}   # frequency table shared with forked workers (read-only)
 def _keys_task(args):
     start, names, addrs, countries = args
     out = keys_for_rows(names, addrs, countries, _FREQ.get("freq"))
-    return start, {ch: (out[ch][0], out[ch][1] + np.int32(start)) for ch in CHANNELS}
+    res = {ch: (out[ch][0], out[ch][1] + np.int32(start)) for ch in CHANNELS}
+    if _FREQ.get("keep_text"):
+        res["_text"] = out["_text"]
+    return start, res
 
 
 def compute_keys(
     names: Sequence[str], addrs: Sequence[str], countries: Sequence[str],
     workers: int = 0, chunk: int = 20_000, freq: Optional[TokenFreq] = None,
+    keep_text: bool = False,
 ) -> KeyChunk:
     """keys_for_rows over many records, in parallel.  Rows keep their order.
 
@@ -343,6 +358,7 @@ def compute_keys(
     tasks = [(s, names[s:s + chunk], addrs[s:s + chunk], countries[s:s + chunk])
              for s in range(0, n, chunk)]
     _FREQ["freq"] = freq
+    _FREQ["keep_text"] = keep_text
     try:
         if workers and workers > 1 and len(tasks) > 1:
             with get_context("fork").Pool(workers, initializer=_die_with_parent) as pool:
@@ -352,11 +368,16 @@ def compute_keys(
     finally:
         _FREQ.clear()
     parts.sort(key=lambda p: p[0])
-    return {
+    out = {
         ch: (np.concatenate([p[1][ch][0] for p in parts]) if parts else np.empty(0, np.uint64),
              np.concatenate([p[1][ch][1] for p in parts]) if parts else np.empty(0, np.int32))
         for ch in CHANNELS
     }
+    if keep_text:
+        out["_text"] = pd.DataFrame({
+            "name": pd.Series([x for p in parts for x in p[1]["_text"][0]], dtype="str"),
+            "addr": pd.Series([x for p in parts for x in p[1]["_text"][1]], dtype="str")})
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -371,6 +392,11 @@ class KeyIndex:
     rows: Dict[str, np.ndarray]    # channel -> int32 target row, aligned
     codes: np.ndarray              # int64 target_code per row
     country: Optional[str] = None  # shard label; None = all countries
+    # COUNT_CHANNELS -> per target row, how many pool records share its key
+    # (0 when the row has no such key, e.g. an empty address)
+    row_counts: Optional[Dict[str, np.ndarray]] = None
+    # cleaned name / expanded address per row (build_index(keep_text=True))
+    text: Optional[pd.DataFrame] = None
 
     @property
     def n_targets(self) -> int:
@@ -391,6 +417,7 @@ def build_index(
     freq: Optional[TokenFreq] = None,
     workers: int = 0,
     read_chunk: int = 400_000,
+    keep_text: bool = False,
     log: Callable[[str], None] = lambda m: None,
 ) -> KeyIndex:
     """Index the S2/S3 files, streaming them in chunks.
@@ -406,6 +433,7 @@ def build_index(
     key_parts: Dict[str, List[np.ndarray]] = {ch: [] for ch in CHANNELS}
     row_parts: Dict[str, List[np.ndarray]] = {ch: [] for ch in CHANNELS}
     code_parts: List[np.ndarray] = []
+    text_parts: List[pd.DataFrame] = []
     offset = 0
     for source in sorted(source_paths):
         for df in iter_source(source_paths[source], chunksize=read_chunk):
@@ -420,7 +448,9 @@ def build_index(
             if not len(df):
                 continue
             kc = compute_keys(df["business_name"].tolist(), df["business_address"].tolist(),
-                              df["country"].tolist(), workers=workers, freq=freq)
+                              df["country"].tolist(), workers=workers, freq=freq, keep_text=keep_text)
+            if keep_text:
+                text_parts.append(kc["_text"])
             for ch in CHANNELS:
                 key_parts[ch].append(kc[ch][0])
                 row_parts[ch].append(kc[ch][1] + np.int32(offset))
@@ -436,10 +466,21 @@ def build_index(
         o = np.argsort(k, kind="stable")
         keys[ch], rows[ch] = k[o], r[o]
         del k, r, o
+    n_rows = offset
+    row_counts = {}
+    for ch in COUNT_CHANNELS:
+        k, r = keys[ch], rows[ch]
+        cnt = np.zeros(n_rows, np.int32)
+        if len(k):
+            starts = np.flatnonzero(np.r_[True, k[1:] != k[:-1]])
+            sizes = np.diff(np.r_[starts, len(k)])
+            cnt[r] = np.repeat(sizes, sizes).astype(np.int32)
+        row_counts[ch] = cnt
     return KeyIndex(
         keys=keys, rows=rows,
         codes=np.concatenate(code_parts) if code_parts else np.empty(0, np.int64),
-        country=country,
+        country=country, row_counts=row_counts,
+        text=(pd.concat(text_parts, ignore_index=True) if text_parts else None) if keep_text else None,
     )
 
 
@@ -557,6 +598,26 @@ def generate_candidates(
         anchor=cat(0, np.int32), target=cat(1, np.int32), score=cat(2, np.float32),
         channels=cat(3, np.uint16), rank=cat(4, np.int16),
     )
+
+
+def pair_counts(index: KeyIndex, anchor_keys: KeyChunk, anchor: np.ndarray,
+                target: np.ndarray, n_anchors: int) -> Dict[str, np.ndarray]:
+    """Per pair, how many POOL records share the exact cleaned name / address
+    of the candidate (t_*) and of the S1 record (a_*).  0 = no such key.
+
+    These are unsupervised counts over the pool being searched -- the
+    training pool in training, the test pool at test time."""
+    out = {}
+    for ch, tag in (("name_exact", "name"), ("addr_exact", "addr")):
+        out[f"t_{tag}_cnt"] = index.row_counts[ch][target].astype(np.float32)
+        ah, ar = anchor_keys[ch]
+        per_anchor = np.zeros(n_anchors, np.float32)
+        if len(ah):
+            sk = index.keys[ch]
+            size = np.searchsorted(sk, ah, "right") - np.searchsorted(sk, ah, "left")
+            per_anchor[ar] = size
+        out[f"a_{tag}_cnt"] = per_anchor[anchor]
+    return out
 
 
 def candidate_id_lists(cands: Candidates, index: KeyIndex, n_anchors: int) -> List[List[str]]:

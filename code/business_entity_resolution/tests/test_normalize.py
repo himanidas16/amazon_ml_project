@@ -206,3 +206,16 @@ def test_cross_script_pair_becomes_comparable():
         "shree best business private limited", "श्री बेस्ट बिजनेस प्राइवेट लिमिटेड"
     )
     assert raw_score < 20          # unmatchable before
+
+
+# ---- country-scoped abbreviations -------------------------------------------
+
+def test_french_abbreviations_apply_only_to_france():
+    from business_er.normalize import address_views
+    fr = address_views("63 R. DE DIEPPE, ST MALO", "France")["expanded"]
+    assert "rue" in fr.split() and "saint" in fr.split()
+    us = address_views("105 ELM ST, R A KIDWAI", "US")["expanded"]
+    assert "saint" not in us.split() and "rue" not in us.split()      # Street / initial untouched
+    unknown = address_views("63 R. DE DIEPPE", "Narnia")["expanded"]
+    assert "rue" not in unknown.split()                               # open set: no table, no crash
+    assert address_views("63 R. DE DIEPPE")["expanded"] == unknown    # default = no country table

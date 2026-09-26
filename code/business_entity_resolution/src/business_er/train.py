@@ -94,13 +94,20 @@ def dev_split(anchor: np.ndarray, dev_fraction: float = 0.1, seed: int = 7) -> n
 def train_matcher(
     X: np.ndarray, y: np.ndarray, anchor: np.ndarray,
     params: Optional[Dict] = None, num_rounds: int = 3000, early_stopping: int = 100,
-    dev_fraction: float = 0.1, log_every: int = 100,
+    dev_fraction: float = 0.1, log_every: int = 100, weight: Optional[np.ndarray] = None,
 ) -> Matcher:
+    """weight: optional per-pair weight.  When easy negatives are subsampled
+    at rate r, give the kept ones weight 1/r so the loss -- and therefore the
+    probabilities the decision rule thresholds -- keep their natural scale."""
     p = {**DEFAULT_PARAMS, **(params or {})}
     dev = dev_split(anchor, dev_fraction)
     names = list(FEATURE_NAMES)
-    dtrain = lgb.Dataset(X[~dev], label=y[~dev], feature_name=names, free_raw_data=True)
-    ddev = lgb.Dataset(X[dev], label=y[dev], feature_name=names, reference=dtrain)
+    # Bin the data ONCE and take train/dev as subsets of it: no copies of X
+    # (the copies were the memory peak when training on 10M+ pairs).
+    full = lgb.Dataset(X, label=y, weight=weight, feature_name=names, free_raw_data=True,
+                       params={"max_bin": p["max_bin"], "verbosity": -1})
+    dtrain = full.subset(np.flatnonzero(~dev))
+    ddev = full.subset(np.flatnonzero(dev))
     evals: Dict = {}
     booster = lgb.train(
         p, dtrain, num_boost_round=num_rounds, valid_sets=[ddev], valid_names=["dev"],
@@ -113,5 +120,6 @@ def train_matcher(
         "best_iteration": booster.best_iteration,
         "dev_logloss": float(min(evals["dev"]["binary_logloss"])),
         "n_train_pairs": int((~dev).sum()), "n_dev_pairs": int(dev.sum()),
+        "weighted": weight is not None,
     }
     return Matcher(booster, names, meta)

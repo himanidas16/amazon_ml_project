@@ -44,7 +44,7 @@ import re
 import unicodedata
 from typing import Dict, Iterable, List
 
-NORMALIZE_VERSION = "1.0.0"
+NORMALIZE_VERSION = "1.1.0"   # 1.1: France-only abbreviations; cie/ets legal forms
 
 # --------------------------------------------------------------------------
 # Indic transliteration
@@ -121,6 +121,8 @@ for _d in range(10):                             # Indic digits -> ASCII digits
     _OFFSETS[0x66 + _d] = (_DIGIT, str(_d))
 
 _ZERO_WIDTH = {0x200C, 0x200D, 0x00AD}
+# Exactly the recognized characters; compiled search avoids Python per-character scans.
+_INDIC_PATTERN = re.compile("[" + re.escape("".join(chr(b + o) for b in INDIC_BLOCKS for o in _OFFSETS) + "".join(chr(c) for c in sorted(_ZERO_WIDTH))) + "]")
 
 
 def _indic_info(ch: str):
@@ -135,7 +137,12 @@ def _indic_info(ch: str):
 
 
 def has_indic(text: str) -> bool:
-    return any(_indic_info(ch) is not None for ch in text)
+    # ASCII cannot contain an Indic character or one of the special zero-width
+    # characters handled by _indic_info. Avoid nine Unicode-block comparisons
+    # per character for the overwhelmingly common ASCII records.
+    if text.isascii():
+        return False
+    return _INDIC_PATTERN.search(text) is not None
 
 
 def transliterate_indic(text: str, drop_final_a: bool = True) -> str:
@@ -231,6 +238,8 @@ def strip_accents(text: str) -> str:
     view is worth having. It is applied AFTER transliteration so it never eats
     Indic vowel signs.
     """
+    if text.isascii():
+        return text
     decomposed = unicodedata.normalize("NFD", text)
     return unicodedata.normalize(
         "NFC", "".join(c for c in decomposed if not unicodedata.combining(c))
@@ -255,6 +264,7 @@ pvt pvtltd private plc gmbh bv nv ag
 sarl sas sasu eurl sci sa sca snc scop
 and sons son bros brothers group holdings holding enterprises enterprise
 services service solutions solution
+cie ets etablissements
 """.split())
 
 # Address abbreviations, applied token-wise (never as substring replacement, or
@@ -289,8 +299,27 @@ def drop_legal_suffixes(text: str) -> str:
     return " ".join(kept) if kept else text
 
 
-def expand_address_tokens(text: str) -> str:
-    return " ".join(ADDRESS_ABBREV.get(t, t) for t in text.split())
+# Abbreviations that are safe only for one country's addresses.  Measured on
+# the training data before adding: "st" is Street in 74k US addresses but
+# Saint in France; "r" is an initial in 8k Indian addresses ("R A KIDWAI
+# ROAD") but rue in France; "ter" is Terrace in the US.  So these apply ONLY
+# to records whose country label matches -- every other label, including
+# ones never seen, simply gets no extra table.  Small and hand-written, as the
+# organizers allow; no gazetteer or place list.
+ADDRESS_ABBREV_BY_COUNTRY: Dict[str, Dict[str, str]] = {
+    "France": {
+        "r": "rue", "st": "saint", "ste": "sainte", "all": "allee", "al": "allee",
+        "ch": "chemin", "che": "chemin", "chem": "chemin", "crs": "cours",
+        "q": "quai", "imp": "impasse", "rte": "route", "fg": "faubourg",
+        "fbg": "faubourg", "bld": "boulevard", "bvd": "boulevard", "pl": "place",
+        "res": "residence", "bat": "batiment", "sq": "square", "prom": "promenade",
+    },
+}
+
+
+def expand_address_tokens(text: str, country: str | None = None) -> str:
+    extra = ADDRESS_ABBREV_BY_COUNTRY.get(country or "", {})
+    return " ".join(extra.get(t, ADDRESS_ABBREV.get(t, t)) for t in text.split())
 
 
 def numbers_in(text: str) -> List[str]:
@@ -326,8 +355,11 @@ def name_views(raw: str) -> Dict[str, str]:
     }
 
 
-def address_views(raw: str) -> Dict[str, str]:
-    """All views of an address, plus its digit groups."""
+def address_views(raw: str, country: str | None = None) -> Dict[str, str]:
+    """All views of an address, plus its digit groups.
+
+    country only selects an extra abbreviation table for the "expanded" view
+    (see ADDRESS_ABBREV_BY_COUNTRY); every other view ignores it."""
     lower = to_lower(raw)
     translit = transliterate_indic(lower) if has_indic(lower) else lower
     plain = collapse_punct(translit)
@@ -338,7 +370,7 @@ def address_views(raw: str) -> Dict[str, str]:
         "translit": translit,
         "plain": plain,
         "folded": folded,
-        "expanded": expand_address_tokens(folded),
+        "expanded": expand_address_tokens(folded, country),
         "numbers": " ".join(numbers_in(raw)),
     }
 

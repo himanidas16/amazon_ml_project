@@ -29,6 +29,9 @@ from business_er.train import Matcher, train_matcher  # noqa: E402
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--tag", default="v1")
+ap.add_argument("--pairs-dir", default=None,
+                help="folder from build_pairs_v2.py (train_*/val_* parquet parts + anchors_*); "
+                     "default: the v1 files artifacts/pairs_{train,val}.parquet")
 args = ap.parse_args()
 
 OUT = ROOT / "artifacts"
@@ -41,31 +44,46 @@ def mark(m):
     print(f"[{time.time() - t0:6.1f}s {rss:4.1f}GB] {m}", flush=True)
 
 
+PAIRS = Path(args.pairs_dir) if args.pairs_dir else None
+if PAIRS is not None and not PAIRS.is_absolute():
+    PAIRS = ROOT / PAIRS
+
+
 def load(name):
-    df = pd.read_parquet(OUT / f"pairs_{name}.parquet")
+    """(X, label, anchor, weight or None); validation sorted by anchor."""
+    if PAIRS is None:
+        df = pd.read_parquet(OUT / f"pairs_{name}.parquet")
+    else:
+        files = sorted(PAIRS.glob(f"{name}_*.parquet"))
+        files = [f for f in files if not f.name.startswith(f"anchors_")]
+        from business_er.pair_data import load_pair_parts
+        # Training needs anchor identities, not sorted rows. Validation retains
+        # the established sorted-anchor score order. Avoid full pandas copies.
+        return load_pair_parts(files, sort_anchors=(name == "val"))
     X = df[list(FEATURE_NAMES)].to_numpy(dtype=np.float32)
-    return X, df["label"].to_numpy(np.int8), df["anchor"].to_numpy(np.int64)
+    w = df["weight"].to_numpy(np.float32) if "weight" in df.columns else None
+    return X, df["label"].to_numpy(np.int8), df["anchor"].to_numpy(np.int64), w
 
 
 # ---- train -----------------------------------------------------------------
-X, y, anchor = load("train")
-mark(f"train pairs {X.shape}, positives {y.mean():.3%}")
-m = train_matcher(X, y, anchor)
+X, y, anchor, w = load("train")
+mark(f"train pairs {X.shape}, positives {y.mean():.3%}, weighted={w is not None}")
+m = train_matcher(X, y, anchor, weight=w)
 model_path = OUT / "models" / f"matcher_{args.tag}.lgb"
 m.save(model_path)
 mark(f"trained: best iteration {m.meta['best_iteration']}, dev logloss "
      f"{m.meta['dev_logloss']:.4f} -> {model_path.name}")
-del X, y, anchor
+del X, y, anchor, w
 
 print("\n  top features by gain:")
 for f, g in list(m.importance().items())[:15]:
     print(f"    {f:<18}{g:6.1%}")
 
 # ---- validate --------------------------------------------------------------
-X, y, anchor = load("val")
+X, y, anchor, _ = load("val")
 p = m.predict(X)
 del X
-n_true = pd.read_parquet(OUT / "anchors_val.parquet")["n_true"].to_numpy()
+n_true = pd.read_parquet((PAIRS or OUT) / "anchors_val.parquet")["n_true"].to_numpy()
 n = len(n_true)
 mark(f"scored {len(p):,} val pairs")
 

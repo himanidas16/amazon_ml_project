@@ -151,7 +151,7 @@ print("  leak check passed: no fold-0 record in training pairs")
 
 # ---- candidate text ----------------------------------------------------------
 need = np.unique(np.concatenate([p["code"] for p in pairs.values()]))
-names_, addrs_, codes_ = [], [], []
+names_, addrs_, ctry_, codes_ = [], [], [], []
 for s, path in SRC.items():
     for df in iter_source(path):
         cd = target_code(s, df["entity_id"].str.slice(3).astype(np.int64).to_numpy())
@@ -159,18 +159,20 @@ for s, path in SRC.items():
         codes_.append(cd[m])
         names_ += df["business_name"][m].tolist()
         addrs_ += df["business_address"][m].tolist()
+        ctry_ += df["country"][m].tolist()
 codes_ = np.concatenate(codes_)
 assert len(codes_) == len(need), "some candidate text not found"
 mark(f"fetched text of {len(need):,} candidate records")
-T = prepare(names_, addrs_, workers=args.workers)
-del names_, addrs_
+T = prepare(names_, addrs_, workers=args.workers, countries=ctry_)
+del names_, addrs_, ctry_
 t_order = np.argsort(codes_)
 mark("prepared candidate text")
 
 # ---- features ------------------------------------------------------------------
 for name, p in pairs.items():
     a = anchors[name]
-    A = prepare(a["business_name"].tolist(), a["business_address"].tolist(), workers=args.workers)
+    A = prepare(a["business_name"].tolist(), a["business_address"].tolist(), workers=args.workers,
+                countries=a["country"].tolist())
     t_pos = t_order[np.searchsorted(codes_[t_order], p["code"])]
     meta = {"anchor": p["anchor"], "score": p["score"], "rank": p["rank"],
             "channels": p["channels"], "source": (p["code"] // SOURCE_BASE).astype(np.int8)}
